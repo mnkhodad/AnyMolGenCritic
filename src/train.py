@@ -1,10 +1,7 @@
 import os
 import sys
 import argparse
-#from numpy.lib.arraysetops import unique
-print("Importing numpy...")
 from numpy import unique
-print("Importing rdkit...")
 from rdkit import Chem
 print("Importing random...")
 import random
@@ -17,6 +14,9 @@ from torch.utils.data import DataLoader
 import shutil
 
 import torch.distributed as dist
+#added
+import torch.nn as nn
+
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import NeptuneLogger
@@ -38,6 +38,8 @@ import numpy as np
 from model.generator import prot
 import argparse
 print("5alas...")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class CondGeneratorLightningModule(pl.LightningModule):
     def __init__(self, hparams):
@@ -103,6 +105,37 @@ class CondGeneratorLightningModule(pl.LightningModule):
         self.collate_fn = collate_fn
 
     def setup_model(self):
+        # Added: passing protein embedding to CondGenerator in generator 
+        # if self.hparams.use_protein:
+            #protein_model = prot(protein_seq=self.hparams.protein_seq, use_protein=True)
+    
+            #with torch.no_grad():
+            # protein_context = torch.randn(1, 153, self.hparams.emb_size).to(self.device)
+                #protein_context = protein_model.embeddings[0].unsqueeze(0).to(self.device)  # [1, seq_len, 1024]
+    
+                #self.protein_proj = nn.Linear(1280, self.hparams.emb_size).to(self.device)  # match your embedding dim
+                #protein_context = self.protein_proj(protein_context).detach()  # final shape: [1, seq_len, emb_size]
+    
+        #     print("embedding:")
+        #     print(protein_context)
+        #     print(self.hparams.protein_seq)
+        #     print("SUCESSSSSSSSSSSSSSSS")
+    
+        # else:
+        #     protein_context = None
+        if self.hparams.use_protein:
+            # Use prot wrapper class to get the ESM2 embedding
+            protein_model = prot(protein_seq=self.hparams.protein_seq, use_protein=True)
+            with torch.no_grad():
+                protein_embedding = protein_model.embeddings[0].unsqueeze(0).to(self.device)  # [1, seq_len, 1280]
+        
+            print("Got protein embedding from prot:", protein_embedding.shape)
+        
+            # Remove projection from here – move to model
+            protein_context = protein_embedding  # pass unprojected into the model
+        else:
+            protein_context = None
+
         self.model = CondGenerator(
             num_layers=self.hparams.num_layers,
             emb_size=self.hparams.emb_size,
@@ -131,7 +164,14 @@ class CondGeneratorLightningModule(pl.LightningModule):
             cond_lin=self.hparams.cond_lin,
             cat_var_index=self.hparams.cat_var_index,
             cont_var_index=self.hparams.cont_var_index,
+            #added
+            use_protein=self.hparams.use_protein,
+            protein_context=protein_context
+
         )
+        self.model.use_protein = self.hparams.use_protein
+        self.model.protein_context = protein_context
+    
 
     ### Dataloaders and optimizers
     def train_dataloader(self):
@@ -140,7 +180,8 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
-            num_workers=0 if self.hparams.test else self.hparams.num_workers,
+            #if self.hparams.test else self.hparams.num_workers,
+            num_workers=47, 
             drop_last=False,
             persistent_workers=not self.hparams.test and self.hparams.num_workers > 0, pin_memory=True,
         )
@@ -151,7 +192,8 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
-            num_workers=0 if self.hparams.test else self.hparams.num_workers,
+            # if self.hparams.test else self.hparams.num_workers,
+            num_workers=47, 
             drop_last=False,
             persistent_workers=not self.hparams.test and self.hparams.num_workers > 0, pin_memory=True,
         )
@@ -163,7 +205,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
                 DummyDataset(),
                 batch_size=1,
                 shuffle=False,
-                num_workers=0,
+                num_workers=47,
             )
         elif self.hparams.test_on_train_data:
             dset = self.train_dataset
@@ -174,7 +216,8 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
-            num_workers=self.hparams.num_workers if self.hparams.test else 0,
+            num_workers = 47,
+            #num_workers=self.hparams.num_workers if self.hparams.test else 0,
             drop_last=False,
             persistent_workers=False, pin_memory=True,
         )
@@ -432,10 +475,11 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.sample_batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
-            num_workers=self.hparams.num_workers-1,
+            num_workers=47,
             drop_last=False,
             persistent_workers=False, pin_memory=True,
         )
+        print("got here")
         train_loader_iter = iter(my_loader)
 
         offset = 0
@@ -443,6 +487,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
         loss_prop = []
         properties = None
         self.model.eval()
+        print("breathed")
         while offset < num_samples:
             cur_num_samples = min(num_samples - offset, self.hparams.sample_batch_size)
             offset += cur_num_samples
@@ -460,6 +505,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
                     _, batched_cond_data_ = next(train_loader_iter)
                 batched_cond_data = torch.cat((batched_cond_data, batched_cond_data_), dim=0)
             batched_cond_data = batched_cond_data[:cur_num_samples,:].to(device=self.device)
+            print("in the middle")
             if properties is None:
                 properties = batched_cond_data
             else:
@@ -478,7 +524,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
         disable_rdkit_log()
         smiles_list = [canonicalize(elem[0]) for elem in results]
         enable_rdkit_log()
-
+        print("got here")
         return smiles_list, results, properties, loss_prop
 
     def check_samples(self):
@@ -878,18 +924,18 @@ if __name__ == "__main__":
     parser.add_argument("--log_every_n_steps", type=int, default=50)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--load_checkpoint_path", type=str, default="")
-    parser.add_argument("--save_checkpoint_dir", type=str, default="/data/stgg/src")
+    parser.add_argument("--save_checkpoint_dir", type=str, default="/data/stggnew/src")
     parser.add_argument("--tag", type=str, default="default")
     parser.add_argument("--test", action="store_true")
     hparams = parser.parse_args()
 
-    if hparams.use_protein:
-        model = prot(protein_seq=hparams.protein_seq, use_protein=True)
-    else:
-        model = prot(protein_seq=None, use_protein=False)
-    print(model)
-    print(hparams.protein_seq)
-    print("SUCESSSSSSSSSSSSSSSS")
+    # if hparams.use_protein:
+    #     model = prot(protein_seq=hparams.protein_seq, use_protein=True)
+    # else:
+    #     model = prot(protein_seq=None, use_protein=False)
+    # print(model)
+    # print(hparams.protein_seq)
+    # print("SUCESSSSSSSSSSSSSSSS")
 
 
     ## Add any specifics to your dataset here in terms of what to test, max_len expected, and properties (which are binary, which are continuous)
@@ -917,6 +963,9 @@ if __name__ == "__main__":
         if hparams.dataset_name == 'chromophore':
             assert hparams.max_len >= 500
         hparams.cat_var_index = []
+    elif hparams.dataset_name in ['bindingdb']:
+        hparams.n_properties = 4
+        assert hparams.max_len >= 150
     else:
         raise NotImplementedError()
     hparams.cont_var_index = [i for i in range(hparams.n_properties) if i not in hparams.cat_var_index]
